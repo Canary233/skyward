@@ -67,6 +67,14 @@ enum Cmd {
         /// The monospaced typeface's licence, which goes with it.
         #[arg(long)]
         mono_license: PathBuf,
+        /// The bridge that serves the framework's secure element service to
+        /// the weaver, which a recovery otherwise has no one to serve.
+        #[arg(long)]
+        sebridge: Option<PathBuf>,
+        /// The program that keeps the secure element's app loaded in the
+        /// secure world for the element's service.
+        #[arg(long)]
+        qsee_probe: Option<PathBuf>,
         #[arg(long)]
         out: PathBuf,
     },
@@ -105,7 +113,7 @@ fn main() -> Result<()> {
             img.kernel = BootImage::read(&kernel)?.kernel;
             write(&out, &img, &img.to_bytes()?)
         }
-        Cmd::Recovery { stock, binary, system_init, config, font, mono, mono_license, out } => {
+        Cmd::Recovery { stock, binary, system_init, config, font, mono, mono_license, sebridge, qsee_probe, out } => {
             let cfg = skyward_config::DeviceConfig::load(&config)?;
             let size = partition_size(&stock)?;
             let mut img = BootImage::read(&stock)?;
@@ -126,6 +134,12 @@ fn main() -> Result<()> {
                 rd.link(command, recovery)?;
             }
             rd.add(paths::SYSTEM_INIT, 0o755, read(&system_init)?)?;
+            if let Some(file) = &sebridge {
+                rd.add(paths::SEBRIDGE, 0o755, read(file)?)?;
+            }
+            if let Some(file) = &qsee_probe {
+                rd.add(paths::QSEE_PROBE, 0o755, read(file)?)?;
+            }
             rd.add(paths::CONFIG, 0o644, read(&config)?)?;
             rd.add(paths::FONT, 0o644, read(&font)?)?;
             rd.add(paths::MONO, 0o644, read(&mono)?)?;

@@ -518,7 +518,13 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot) -> Result<()> {
         skyward_sys::kmsg(&format!("{handed} of the phone's own files handed to the accounts its init gives them"))?;
     }
     let hardware: Vec<String> = services.iter().filter_map(|s| s.ready_hardware_service.clone()).collect();
-    if !hardware.is_empty() {
+    // The directory for the older kind of hardware services is itself a
+    // program of the installed system, and asks for the loader that system
+    // keeps for programs it starts before anything is mounted. It needs that
+    // loader whether or not any service in this configuration registers with
+    // it through a name of its own.
+    let directory = services.iter().any(|s| s.path.ends_with("/hwservicemanager"));
+    if !hardware.is_empty() || directory {
         secure::prepare_hardware_directory(&hardware)?;
         skyward_sys::kmsg("the directory for the phone's hardware services can run")?;
     }
@@ -533,6 +539,10 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot) -> Result<()> {
     if !registering.is_empty() || !files.is_empty() {
         let described = secure::publish_descriptions(&registering, &files)?;
         skyward_sys::kmsg(&format!("{described} of the phone's own service descriptions published"))?;
+    }
+    let adopted = secure::adopt_libraries()?;
+    if adopted > 0 {
+        skyward_sys::kmsg(&format!("{adopted} of the installed system's libraries given to the recovery's programs"))?;
     }
     let libraries = secure::libraries()?;
     if let Some(dir) = &libraries {
@@ -556,7 +566,15 @@ fn hand_over(owners: &[skyward_config::Owners]) -> Result<usize> {
     for run in owners {
         let (uid, gid) = (id(&run.user)?, id(&run.group)?);
         for path in &run.paths {
-            std::os::unix::fs::chown(path, Some(uid), Some(gid)).with_context(|| format!("give {path} to {}:{}", run.user, run.group))?;
+            // A module just loaded makes its nodes through ueventd, which
+            // may not have made this one yet.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while let Err(error) = std::os::unix::fs::chown(path, Some(uid), Some(gid)) {
+                if error.kind() != std::io::ErrorKind::NotFound || std::time::Instant::now() >= deadline {
+                    return Err(error).with_context(|| format!("give {path} to {}:{}", run.user, run.group));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(run.mode))
                 .with_context(|| format!("give {path} the mode {:o}", run.mode))?;
             handed += 1;

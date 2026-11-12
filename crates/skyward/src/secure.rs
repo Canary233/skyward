@@ -65,6 +65,18 @@ const HARDWARE_DRIVER_NODE: &str = "/dev/binderfs/hwbinder";
 /// itself off when the running system does not describe it.
 const HARDWARE_DIRECTORY: &str = "android.hidl.manager@1.2::IServiceManager/default";
 
+/// Libraries the installed system keeps and a recovery's own system may not,
+/// which programs from the vendor partition ask for by name. The loader
+/// looks for them in the recovery's system and the vendor partition, not in
+/// the installed system, so they are copied beside the recovery's own before
+/// those programs start. The second is the runtime bundle's own, which the
+/// installed system keeps reachable under this name for programs built
+/// before any partition is mounted.
+const INSTALLED_LIBRARIES: [(&str, &str); 2] = [
+    ("libvndksupport.so", "/mnt/system/system/lib64/libvndksupport.so"),
+    ("libdl_android.so", "/mnt/system/system/lib64/bootstrap/libdl_android.so"),
+];
+
 /// What says the directory is off. It is read by the services, and in a
 /// recovery there is nothing else to set it.
 const DIRECTORY_OFF: &str = "hwservicemanager.disabled";
@@ -160,6 +172,30 @@ fn describe_hardware(wanted: &[String]) -> Result<String> {
 pub fn libraries() -> Result<Option<PathBuf>> {
     let Some(version) = skyward_sys::prop(VENDOR_INTERFACE) else { return Ok(None) };
     Ok(bundle(&format!("com.android.vndk.v{version}"))?.map(|at| at.join(BUNDLE_LIBS)))
+}
+
+/// Put the installed system's copies of the libraries in
+/// [`INSTALLED_LIBRARIES`] beside the recovery's own, under the names the
+/// programs from the vendor partition ask for. A library the installed
+/// system does not carry is left alone.
+pub fn adopt_libraries() -> Result<usize> {
+    let into = Path::new("/system/lib64");
+    let mut copied = 0;
+    for (name, from) in INSTALLED_LIBRARIES {
+        let from = Path::new(from);
+        if !from.is_file() {
+            continue;
+        }
+        let to = into.join(name);
+        let mut part = to.clone().into_os_string();
+        part.push(".part");
+        fs::copy(from, &part).with_context(|| format!("copy {name} from {}", from.display()))?;
+        fs::set_permissions(&part, std::os::unix::fs::PermissionsExt::from_mode(0o644))
+            .with_context(|| format!("open {name} to every user"))?;
+        fs::rename(&part, &to).with_context(|| format!("put {name} in place at {}", to.display()))?;
+        copied += 1;
+    }
+    Ok(copied)
 }
 
 /// Open the bundle of this name where it lies, and give where it is. A

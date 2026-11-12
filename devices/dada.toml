@@ -6,6 +6,12 @@ ab = true
 soc = { hans = "骁龙®8至尊版移动平台", hant = "Snapdragon® 8 Elite 行動平台", en = "Snapdragon® 8 Elite Mobile Platform" }
 os_version_prop = "ro.mi.os.version.incremental"
 
+# The secure element's library, libEseUtils, picks the driver it drives when
+# ro.arch is this value; the element's service starts before the installed
+# system's properties are reachable.
+[props]
+"ro.arch" = "exynos9810"
+
 [display]
 # persist.sys.miui_resolution in the odm partition's build.prop, which is
 # vendor.display.default_resolution there as well.
@@ -15,9 +21,19 @@ density = 520
 
 [modules]
 sources = ["vendor_boot", "vendor_dlkm", "vendor", "system_dlkm"]
-# The touchscreen: Synaptics TouchComm over SPI behind Xiaomi's touch
-# layer, the one touch driver the phone's own modules.load lists.
-load = ["synaptics_tcm2"]
+# The touchscreen is Synaptics TouchComm over SPI behind Xiaomi's touch
+# layer, the one touch driver the phone's own modules.load lists. The
+# secure element's GPIO driver makes the node its service opens; the
+# phone's own start loads it from the vendor partition too.
+load = ["synaptics_tcm2", "stm_st54se_gpio"]
+
+# The secure element's driver makes this node root-owned, while its service
+# runs as system in the nfc group, as the phone's own init gives it.
+[[owners]]
+user = "system"
+group = "nfc"
+mode = 0o660
+paths = ["/dev/st54spi_gpio"]
 
 # As on the 17 Ultra, no init script of the phone's starts touch_report:
 # the touch feature service turns the controller's raw frames into
@@ -52,6 +68,28 @@ ready_property = "vendor.sys.listeners.registered"
 user = "root"
 groups = ["root", "drmrpc"]
 
+# The opener the secure world's apps are reached through by programs that
+# speak to them as GlobalPlatform's TEE client does. It loads the apps from
+# the modem partition's firmware folder as they are first asked for. Its
+# init script has init make the socket it serves on; a recovery runs no
+# init of the phone's, so it runs as root and makes the socket itself.
+[[service]]
+path = "/vendor/bin/hlosminkdaemon"
+libraries = ["/system/lib64", "/vendor/lib64"]
+user = "root"
+groups = ["root"]
+
+# The app the secure element's service hands its commands to, kept loaded
+# here: this recovery starts after the point the phone's own start loads it,
+# and the service opens it only when the first command comes, which fails
+# while it is not there. The program holds it loaded until the phone stops.
+[[service]]
+path = "/skyward/qsee-probe"
+args = ["hold"]
+libraries = ["/system/lib64", "/vendor/lib64"]
+user = "system"
+groups = ["nfc", "system"]
+
 # The key service, which is the only thing that can use the keys the phone
 # wrapped in hardware. The same program serves the secure clock and the
 # shared secret, and the remotely provisioned component, which the phone
@@ -81,12 +119,17 @@ groups = ["system", "readproc"]
 
 # The credential service: it is what the secure world has check a screen
 # lock, and the only thing that can hand out the note the key service wants
-# before it will use a key a screen lock guards. This build's is the older
-# kind, which registers with the directory above.
+# before it will use a key a screen lock guards. This build's is the newer
+# kind, which registers with the phone's service directory.
 [[service]]
 path = "/vendor/bin/hw/android.hardware.gatekeeper-service-qti"
-libraries = ["/system/lib64", "/vendor/lib64"]
-ready_hardware_service = "android.hardware.gatekeeper@1.0::IGatekeeper/default"
+# Its implementation library sits in the vendor partition's hardware
+# folder, which a recovery's loader does not search on its own.
+libraries = ["/system/lib64", "/vendor/lib64", "/vendor/lib64/hw"]
+ready_service = "android.hardware.gatekeeper.IGatekeeper/default"
+# The build keeps this one out of its manifest folder, among fragments for
+# the models it serves; this is the smallest that describes the service.
+description = "/vendor/etc/vintf/manifest_kera.xml"
 user = "system"
 groups = ["system"]
 
@@ -96,17 +139,29 @@ groups = ["system"]
 # manifest for it describes.
 [[service]]
 path = "/vendor/bin/hw/android.hardware.secure_element-service.qti"
-libraries = ["/system/lib64", "/vendor/lib64"]
+libraries = ["/system/lib64", "/vendor/lib64", "/vendor/lib64/hw"]
 ready_service = "android.hardware.secure_element.ISecureElement/eSE1"
 user = "system"
 groups = ["nfc", "system"]
 
+# The directory the framework's secure element service would register with,
+# which a recovery does not carry: this bridge takes its place, and speaks
+# to the element's service above on the weaver's behalf.
+[[service]]
+path = "/skyward/sebridge"
+libraries = ["/system/lib64", "/vendor/lib64"]
+ready_service = "android.se.omapi.ISecureElementService/default"
+user = "root"
+groups = ["root"]
+
 # The weaver, in the secure element Thales made for this build: every
 # user's secret is bound to a slot of it, with a screen lock or without. It
-# reaches the element through the service above.
+# reaches the element through the service above. Its libraries reach into
+# the installed system for the support a vendor program of this kind is
+# given at a start, which the recovery's own copy of the system lacks.
 [[service]]
 path = "/odm/bin/hw/android.hardware.weaver-service.thales"
-libraries = ["/system/lib64", "/vendor/lib64", "/odm/lib64"]
+libraries = ["/system/lib64", "/vendor/lib64", "/odm/lib64", "/mnt/system/system/lib64", "/mnt/system/system/lib64/bootstrap"]
 ready_service = "android.hardware.weaver.IWeaver/default"
 user = "vendor_thales_weaver"
 groups = ["vendor_thales_weaver", "system", "drmrpc"]

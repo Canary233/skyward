@@ -21,6 +21,13 @@ pub mod ramdisk {
     /// which Skyward puts in that system's init_boot image: linked
     /// statically, since it runs before any system's libraries are there.
     pub const SYSTEM_INIT: &str = "skyward/system-init";
+    /// The bridge that serves the framework's secure element service, which
+    /// the weaver reaches the element through: the recovery carries none of
+    /// the framework's own.
+    pub const SEBRIDGE: &str = "skyward/sebridge";
+    /// The program that keeps the secure element's app loaded in the secure
+    /// world, which the element's service expects to find there.
+    pub const QSEE_PROBE: &str = "skyward/qsee-probe";
     /// The commands install scripts written for other recoveries run that
     /// Skyward answers itself: 7za, avbctl, resetprop and zstd, which a
     /// stock recovery does not carry, and unzip, whose stock version holds
