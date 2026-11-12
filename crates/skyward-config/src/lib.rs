@@ -1,6 +1,6 @@
 use anyhow::{ensure, Context, Result};
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 /// Recovery ramdisk files Skyward reads, adds or changes, as archive paths
@@ -44,6 +44,11 @@ pub mod ramdisk {
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeviceConfig {
     pub device: Device,
+    /// System properties the recovery's first property file sets, which
+    /// programs of this phone read before the installed system's own are
+    /// reachable.
+    #[serde(default)]
+    pub props: BTreeMap<String, String>,
     #[serde(default)]
     pub display: Display,
     #[serde(default)]
@@ -503,6 +508,13 @@ impl DeviceConfig {
 
     pub fn parse(text: &str) -> Result<Self> {
         let cfg: DeviceConfig = toml::from_str(text).context("parse device config")?;
+        for (name, value) in &cfg.props {
+            ensure!(
+                !name.is_empty() && !name.contains(['=', '\n', '\r', ' ']) && !name.contains('\t'),
+                "[props] {name:?} is not a property's name"
+            );
+            ensure!(!value.contains(['\n', '\r']), "[props] {name}: the value runs over a line");
+        }
         for log in &cfg.wipe.logs {
             let path = Path::new(log);
             let plain = path.components().all(|c| matches!(c, std::path::Component::RootDir | std::path::Component::Normal(_)));
@@ -631,6 +643,14 @@ mod tests {
         assert!(cfg.modules.load.is_empty());
         assert_eq!((cfg.firmware, cfg.wlan, cfg.update), (None, None, None), "a phone may have none of them");
         assert_eq!(cfg.logd, None, "a recovery's own logd usually has all it needs");
+    }
+
+    #[test]
+    fn the_recovery_sets_the_properties_the_phone_reads_first() {
+        let cfg = DeviceConfig::parse("[device]\ncodename = \"x\"\n[props]\n\"ro.arch\" = \"exynos9810\"\n").unwrap();
+        assert_eq!(cfg.props.get("ro.arch").map(String::as_str), Some("exynos9810"));
+        assert!(DeviceConfig::parse("[device]\ncodename = \"x\"\n[props]\n\"ro.a=b\" = \"v\"\n").is_err(), "a name with =");
+        assert!(DeviceConfig::parse("[device]\ncodename = \"x\"\n[props]\n\"ro.a\" = \"two\\nlines\"\n").is_err(), "a value over a line");
     }
 
     #[test]

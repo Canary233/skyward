@@ -106,6 +106,7 @@ fn main() -> Result<()> {
             write(&out, &img, &img.to_bytes()?)
         }
         Cmd::Recovery { stock, binary, system_init, config, font, mono, mono_license, out } => {
+            let cfg = skyward_config::DeviceConfig::load(&config)?;
             let size = partition_size(&stock)?;
             let mut img = BootImage::read(&stock)?;
             let mut rd = Ramdisk::decode(&img.ramdisk)?;
@@ -147,6 +148,11 @@ fn main() -> Result<()> {
                 .data;
             let mut props = without(stock_props, &BUILD_VERSION);
             props.extend_from_slice(b"\nro.secure=0\nro.adb.secure=0\nro.debuggable=1\nro.ota.allow_downgrade=true\n");
+            // The phone's own programs read these before the installed
+            // system's property files are reachable.
+            for (name, value) in &cfg.props {
+                props.extend_from_slice(format!("\n{name}={value}\n").as_bytes());
+            }
             rd.replace(paths::PROP_DEFAULT, props)?;
             img.ramdisk = rd.encode()?;
             let bytes = img.to_bytes()?;
