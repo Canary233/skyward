@@ -216,7 +216,7 @@ pub fn open_without_credential(service: &KeyMint) -> Result<Opening> {
         let protector = protector(user)?;
         match protector.lock {
             None => {
-                let note = open_user_files(service, user, None, None)?;
+                let note = open_user_files(service, user, None, None, None)?;
                 if user == OWNER {
                     owner = note;
                 }
@@ -231,7 +231,15 @@ pub fn open_without_credential(service: &KeyMint) -> Result<Opening> {
 /// and, where `user` is the owner, of each of `closed` whose credential
 /// the phone made up behind theirs; give those still closed.
 pub fn unlock(service: &KeyMint, closed: &[Closed], user: u32, credential: &[u8]) -> Result<Vec<Closed>> {
-    let note = open_user_files(service, user, Some(credential), None)?;
+    unlock_with_protector(service, closed, user, credential, None)
+}
+
+/// Open the own files of `user` with what they typed, reading the protector
+/// named rather than the one the phone records as current, and give those
+/// still closed. A phone keeps older protectors for a while after a lock
+/// changes; this tries one of them without changing what the phone records.
+pub fn unlock_with_protector(service: &KeyMint, closed: &[Closed], user: u32, credential: &[u8], protector: Option<&str>) -> Result<Vec<Closed>> {
+    let note = open_user_files(service, user, Some(credential), None, protector)?;
     let rest = closed.iter().filter(|c| c.user != user).cloned().collect();
     Ok(match user == OWNER {
         true => open_made_up(service, rest, &note),
@@ -257,7 +265,7 @@ fn open_made_up(service: &KeyMint, closed: Vec<Closed>, owner: &Note) -> Vec<Clo
         .into_iter()
         .filter_map(|c| match c.made_up {
             false => Some(c),
-            true => match open_user_files(service, c.user, None, Some(token)) {
+            true => match open_user_files(service, c.user, None, Some(token), None) {
                 Ok(_) => None,
                 Err(e) => Some(Closed { why: Some(format!("{e:#}")), ..c }),
             },
@@ -333,6 +341,12 @@ const PROTECTORS: &str = "/data/system_de";
 /// credential opens is the phone's own business, and it writes that down,
 /// so this reads it rather than guess.
 fn protector(user: u32) -> Result<crate::user::Protector> {
+    protector_named(user, None)
+}
+
+/// Read the protector named, or the one the phone records as current where
+/// none is named.
+fn protector_named(user: u32, named: Option<&str>) -> Result<crate::user::Protector> {
     let dir = blobs(user);
     let mut ids = Vec::new();
     for entry in std::fs::read_dir(&dir).with_context(|| format!("read {}", dir.display()))? {
@@ -343,25 +357,31 @@ fn protector(user: u32) -> Result<crate::user::Protector> {
             }
         }
     }
-    let id = match crate::locksettings::current_protector(Path::new(crate::locksettings::DATABASE), user)? {
-        Some(recorded) => {
-            anyhow::ensure!(
-                ids.contains(&recorded),
-                "the phone keeps user {user}'s secret behind the blob {recorded}, which is not among the {} in {}",
-                ids.len(),
-                dir.display()
-            );
-            recorded
+    let id = match named {
+        Some(named) => {
+            anyhow::ensure!(ids.iter().any(|id| id == named), "user {user} has no protector named {named} in {}", dir.display());
+            named.to_string()
         }
-        // Where the phone records none, only a blob that is alone is
-        // beyond doubt the user's.
-        None => match &ids[..] {
-            [only] => only.clone(),
-            _ => anyhow::bail!(
-                "{} holds {} of the user's blobs, and the phone records none of them as the one the user's own credential opens",
-                dir.display(),
-                ids.len()
-            ),
+        None => match crate::locksettings::current_protector(Path::new(crate::locksettings::DATABASE), user)? {
+            Some(recorded) => {
+                anyhow::ensure!(
+                    ids.contains(&recorded),
+                    "the phone keeps user {user}'s secret behind the blob {recorded}, which is not among the {} in {}",
+                    ids.len(),
+                    dir.display()
+                );
+                recorded
+            }
+            // Where the phone records none, only a blob that is alone is
+            // beyond doubt the user's.
+            None => match &ids[..] {
+                [only] => only.clone(),
+                _ => anyhow::bail!(
+                    "{} holds {} of the user's blobs, and the phone records none of them as the one the user's own credential opens",
+                    dir.display(),
+                    ids.len()
+                ),
+            },
         },
     };
     // A user who has set a screen lock has what the phone recorded about
@@ -466,8 +486,8 @@ const TAG_BYTES: usize = 16;
 /// none, and a user the phone made one up for needs `owner`, the note the
 /// owner's own secret gave. The owner's files open, their shared storage
 /// shows at /sdcard.
-fn open_user_files(service: &KeyMint, user: u32, credential: Option<&[u8]>, owner: Option<&Token>) -> Result<Note> {
-    let protector = protector(user)?;
+fn open_user_files(service: &KeyMint, user: u32, credential: Option<&[u8]>, owner: Option<&Token>, named: Option<&str>) -> Result<Note> {
+    let protector = protector_named(user, named)?;
     let stretched = match &protector.lock {
         Some(lock) => {
             let typed = match made_up_credential(service, user, &protector.id, owner)? {

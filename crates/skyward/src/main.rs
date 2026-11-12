@@ -187,6 +187,10 @@ enum Cmd {
         /// world, the same as a wrong try on the screen itself.
         #[arg(long)]
         credential: Option<String>,
+        /// Open the files with the protector named, instead of the one the
+        /// phone records as current, to try one it kept beside it.
+        #[arg(long)]
+        protector: Option<String>,
         /// Close the data partition instead, as a factory reset does before
         /// it erases it: every other program holding it ends first.
         #[arg(long, conflicts_with = "credential")]
@@ -383,7 +387,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         #[cfg(target_os = "android")]
-        Cmd::Data { credential, close: false } => {
+        Cmd::Data { credential, protector, close: false } => {
             use skyward_crypto::data;
             let binder = skyward_binder::driver::Binder::open()?;
             let service = skyward_crypto::keymint::KeyMint::open(&binder)?;
@@ -401,7 +405,7 @@ fn main() -> Result<()> {
             let mut closed = opening.closed;
             let asked = closed.iter().find(|c| !c.made_up).map(|c| c.user);
             if let (Some(credential), Some(user)) = (&credential, asked) {
-                closed = data::unlock(&service, &closed, user, credential.as_bytes())?;
+                closed = data::unlock_with_protector(&service, &closed, user, credential.as_bytes(), protector.as_deref())?;
             }
             for c in &closed {
                 match &c.why {
