@@ -42,6 +42,11 @@ const WIFI: u32 = 1010;
 /// loading meanwhile.
 const INTERFACE_WAIT: Duration = Duration::from_secs(20);
 
+/// How long a file `writes` names may take to appear: the driver makes it
+/// as it starts, and the phone's own init waits a second for the one that
+/// tells the chip the file system is ready.
+const WRITE_WAIT: Duration = Duration::from_secs(10);
+
 /// How long the supplicant may take to open its control socket.
 const SOCKET_WAIT: Duration = Duration::from_secs(10);
 
@@ -673,11 +678,15 @@ fn bring_up(cfg: &Config, modules: &[PathBuf]) -> Result<()> {
         for file in &cfg.firmware {
             place(file)?;
         }
-        for path in skyward_modules::load(modules, &cfg.modules)? {
+        let (loaded, failed) = skyward_modules::load_reporting(modules, &cfg.modules)?;
+        for path in loaded {
             skyward_sys::kmsg(&format!("loaded {}", path.display()))?;
         }
+        for why in &failed {
+            skyward_sys::kmsg(&format!("a WLAN driver did not load: {why}"))?;
+        }
         for w in &cfg.writes {
-            fs::write(&w.path, &w.value).with_context(|| format!("write {} to {}", w.value, w.path))?;
+            write_when_there(w)?;
         }
         let until = Instant::now() + INTERFACE_WAIT;
         while !net.exists() {
@@ -686,6 +695,19 @@ fn bring_up(cfg: &Config, modules: &[PathBuf]) -> Result<()> {
         }
     }
     iface::set_up(&cfg.interface, true)
+}
+
+/// Write each value to its file once the driver has made it, as the phone's
+/// own init waits for the file that tells the chip the file system is ready
+/// before writing it: the driver makes that file as it starts, which may be
+/// after the modules are in.
+fn write_when_there(w: &skyward_config::Write) -> Result<()> {
+    let until = Instant::now() + WRITE_WAIT;
+    while !Path::new(&w.path).exists() {
+        ensure!(Instant::now() < until, "the driver made no {} in {} seconds", w.path, WRITE_WAIT.as_secs());
+        thread::sleep(Duration::from_millis(100));
+    }
+    fs::write(&w.path, &w.value).with_context(|| format!("write {} to {}", w.value, w.path))
 }
 
 /// Put a file the driver asks for where the firmware loader looks.

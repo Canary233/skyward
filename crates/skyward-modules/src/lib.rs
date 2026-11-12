@@ -23,24 +23,51 @@ pub fn source_dir(source: &str) -> Result<PathBuf> {
 /// comes from the first of `dirs` that holds it, and its dependencies from
 /// that directory's modules.dep; a module the kernel already has counts as
 /// loaded. Returns the files loaded, dependencies first.
+///
+/// One that does not load is left out with what depends on it and the rest
+/// still load, as Android's libmodprobe loads a list: a phone may name two
+/// drivers for one chip, of which only the one made for the revision
+/// installed registers, and the other refusing is no reason to leave the
+/// rest of the list unloaded. Only when none of `names` loads is an error
+/// returned, as it is for a list of them that cannot be read.
 pub fn load(dirs: &[PathBuf], names: &[String]) -> Result<Vec<PathBuf>> {
+    Ok(load_reporting(dirs, names)?.0)
+}
+
+/// `load`, also telling which of `names` did not load and why, so that what
+/// the phone says about a WLAN that did not come up names the driver at
+/// fault rather than only the ones that loaded.
+pub fn load_reporting(dirs: &[PathBuf], names: &[String]) -> Result<(Vec<PathBuf>, Vec<String>)> {
     let mut loaded = Vec::new();
+    let mut why = Vec::new();
     for name in names {
-        let file = format!("{name}.ko");
-        let dir = dirs
-            .iter()
-            .find(|d| d.join(&file).is_file())
-            .ok_or_else(|| anyhow!("{file} is in none of {dirs:?}"))?;
-        let graph = parse_dep(dir)?;
-        for m in graph.load_order(std::slice::from_ref(&file)) {
-            let path = graph
-                .resolve_path(&m)
-                .ok_or_else(|| anyhow!("{m} is listed in {}/modules.dep but missing", dir.display()))?;
-            insmod(&path, "")?;
-            loaded.push(path);
+        if let Err(e) = load_one(dirs, name, &mut loaded) {
+            why.push(format!("{name}: {e:#}"));
         }
     }
-    Ok(loaded)
+    if loaded.is_empty() && !names.is_empty() {
+        bail!("none of {} loaded: {}", names.join(", "), why.join("; "));
+    }
+    Ok((loaded, why))
+}
+
+/// Load the one module `name` and what it depends on, adding each file that
+/// loaded to `loaded`.
+fn load_one(dirs: &[PathBuf], name: &str, loaded: &mut Vec<PathBuf>) -> Result<()> {
+    let file = format!("{name}.ko");
+    let dir = dirs
+        .iter()
+        .find(|d| d.join(&file).is_file())
+        .ok_or_else(|| anyhow!("{file} is in none of {dirs:?}"))?;
+    let graph = parse_dep(dir)?;
+    for m in graph.load_order(std::slice::from_ref(&file)) {
+        let path = graph
+            .resolve_path(&m)
+            .ok_or_else(|| anyhow!("{m} is listed in {}/modules.dep but missing", dir.display()))?;
+        insmod(&path, "").with_context(|| format!("load {m}"))?;
+        loaded.push(path);
+    }
+    Ok(())
 }
 
 /// A `modules.dep` graph: each module file mapped to the module files it
@@ -181,5 +208,28 @@ mod tests {
     #[test]
     fn strips_paths_to_basenames() {
         assert_eq!(basename("kernel/drivers/foo/bar.ko"), "bar.ko");
+    }
+
+    /// A phone names two drivers for one chip and the kernel has room for
+    /// only the one its revision needs; the other refusing leaves the rest
+    /// of the list to load.
+    #[test]
+    fn a_module_that_does_not_load_leaves_the_rest_to_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        for name in ["first", "second", "third"] {
+            fs::write(base.join(format!("{name}.ko")), b"").unwrap();
+        }
+        fs::write(base.join("modules.dep"), "first.ko:\nsecond.ko:\nthird.ko:\n").unwrap();
+        let dirs = vec![base.to_path_buf()];
+        // No module loads on the computer, so what the one error says is
+        // which modules were tried: every one of them, not only the first.
+        let err = load(&dirs, &["first".to_string(), "second".to_string(), "third".to_string()]).unwrap_err();
+        let why = format!("{err:#}");
+        for name in ["first", "second", "third"] {
+            assert!(why.contains(&format!("{name}: ")), "{name} was not tried: {why}");
+        }
+        // No module at all to load is no error.
+        assert!(load(&dirs, &[]).unwrap().is_empty());
     }
 }
