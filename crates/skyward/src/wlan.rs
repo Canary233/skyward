@@ -4,7 +4,7 @@
 //! stand each time that changes.
 
 use anyhow::{bail, ensure, Context, Result};
-use skyward_config::{Firmware, Wlan as Config};
+use skyward_config::{Firmware, Setting, Wlan as Config};
 use skyward_net::dhcp::{self, Kept, Lease};
 use skyward_net::http::Servers;
 use skyward_net::iface;
@@ -14,7 +14,7 @@ use skyward_net::wlan::{self, Joined, Link, Next, Power, Stage, Traffic, Wlan};
 use std::fs;
 use std::net::Ipv4Addr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as Process, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -694,7 +694,29 @@ fn bring_up(cfg: &Config, modules: &[PathBuf]) -> Result<()> {
             thread::sleep(Duration::from_millis(100));
         }
     }
-    iface::set_up(&cfg.interface, true)
+    set_up_when_ready(&cfg.interface)
+}
+
+/// Bring the interface up once the kernel and driver have finished making
+/// it. The driver can make its entry in `/sys/class/net` while the
+/// interface is still missing or cannot be opened yet.
+fn set_up_when_ready(interface: &str) -> Result<()> {
+    let until = Instant::now() + INTERFACE_WAIT;
+    loop {
+        match iface::set_up(interface, true) {
+            Ok(()) => return Ok(()),
+            Err(e) if interface_not_ready(&e) && Instant::now() < until => thread::sleep(Duration::from_millis(100)),
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+fn interface_not_ready(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|e| matches!(e.raw_os_error(), Some(libc::ENODEV | libc::EBUSY)))
+    })
 }
 
 /// Write each value to its file once the driver has made it, as the phone's
@@ -718,15 +740,70 @@ fn place(file: &Firmware) -> Result<()> {
     let bytes = match &file.partition {
         None => fs::read(&file.path).with_context(|| format!("read {}", file.path))?,
         Some(partition) => {
-            let at = Path::new(PARTITIONS).join(partition);
-            fs::create_dir_all(&at).with_context(|| format!("make {}", at.display()))?;
-            skyward_block::mount::mount_ro(&Path::new(skyward_block::BY_NAME).join(partition), &at)?;
+            let device = Path::new(skyward_block::BY_NAME).join(partition);
+            let number = fs::metadata(&device).with_context(|| format!("look at {}", device.display()))?.rdev();
+            let already = skyward_block::mount::points_of((
+                libc::major(number as libc::dev_t) as u32,
+                libc::minor(number as libc::dev_t) as u32,
+            ))?
+                .into_iter()
+                .next();
+            let temporary = already.is_none();
+            let at = match already {
+                Some(at) => at,
+                None => {
+                    let at = Path::new(PARTITIONS).join(partition);
+                    fs::create_dir_all(&at).with_context(|| format!("make {}", at.display()))?;
+                    skyward_block::mount::mount_ro(&device, &at)?;
+                    at
+                }
+            };
             let read = fs::read(at.join(&file.path)).with_context(|| format!("read {} on {partition}", file.path));
-            skyward_block::mount::umount(&at)?;
+            if temporary {
+                skyward_block::mount::umount(&at)?;
+            }
             read?
         }
     };
+    let bytes = with_settings(bytes, &file.settings).with_context(|| format!("change the settings in {}", file.path))?;
     fs::write(&to, bytes).with_context(|| format!("write {}", to.display()))
+}
+
+/// Put values into a firmware configuration before the marker where its
+/// parser stops, replacing values the stock file already sets.
+fn with_settings(bytes: Vec<u8>, settings: &[Setting]) -> Result<Vec<u8>> {
+    if settings.is_empty() {
+        return Ok(bytes);
+    }
+    let text = String::from_utf8(bytes).context("read a firmware configuration as text")?;
+    let newline = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let mut lines = text.split_inclusive('\n').map(str::to_owned).collect::<Vec<_>>();
+    for setting in settings {
+        let assignment = format!("{} = {}", setting.name, setting.value);
+        let mut replaced = false;
+        for line in &mut lines {
+            let ending = if line.ends_with("\r\n") {
+                "\r\n"
+            } else if line.ends_with('\n') {
+                "\n"
+            } else {
+                ""
+            };
+            let content = line.trim_end_matches(['\r', '\n']).trim();
+            if content.split_once('=').is_some_and(|(name, _)| name.trim() == setting.name) {
+                *line = format!("{assignment}{ending}");
+                replaced = true;
+            }
+        }
+        if !replaced {
+            if lines.last().is_some_and(|line| !line.ends_with('\n')) {
+                lines.last_mut().expect("the last line is there").push_str(newline);
+            }
+            let at = lines.iter().position(|line| line.trim() == "END").unwrap_or(lines.len());
+            lines.insert(at, format!("{assignment}{newline}"));
+        }
+    }
+    Ok(lines.concat().into_bytes())
 }
 
 /// Start the supplicant on the interface, and wait for its control socket.
@@ -788,4 +865,37 @@ fn end(child: &mut Child, control: Option<&Control>) {
     }
     let _ = child.kill();
     let _ = child.wait();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{interface_not_ready, with_settings};
+    use skyward_config::Setting;
+
+    fn setting(name: &str, value: &str) -> Setting {
+        Setting { name: name.into(), value: value.into() }
+    }
+
+    #[test]
+    fn settings_replace_stock_values_and_stay_before_the_end() {
+        let config = b"alpha = 1\r\nbeta = 2\r\nEND\r\nafter\r\n".to_vec();
+        let changed = with_settings(config, &[setting("beta", "9"), setting("gamma", "3")]).unwrap();
+        assert_eq!(changed, b"alpha = 1\r\nbeta = 9\r\ngamma = 3\r\nEND\r\nafter\r\n");
+    }
+
+    #[test]
+    fn settings_append_to_a_configuration_without_an_end() {
+        let changed = with_settings(b"alpha=1".to_vec(), &[setting("beta", "2")]).unwrap();
+        assert_eq!(changed, b"alpha=1\nbeta = 2\n");
+    }
+
+    #[test]
+    fn only_an_interface_not_ready_yet_is_waited_for() {
+        let missing = anyhow::Error::new(std::io::Error::from_raw_os_error(libc::ENODEV)).context("read how wlan0 stands");
+        assert!(interface_not_ready(&missing));
+        let busy = anyhow::Error::new(std::io::Error::from_raw_os_error(libc::EBUSY)).context("bring wlan0 up");
+        assert!(interface_not_ready(&busy));
+        let refused = anyhow::Error::new(std::io::Error::from_raw_os_error(libc::EACCES)).context("read how wlan0 stands");
+        assert!(!interface_not_ready(&refused));
+    }
 }
