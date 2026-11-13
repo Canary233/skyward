@@ -173,6 +173,18 @@ pub struct Firmware {
     /// read-only while the file is read.
     #[serde(default)]
     pub partition: Option<String>,
+    /// Values to give the file's parser, replacing a value it already has
+    /// or added before its `END` marker.
+    #[serde(default)]
+    pub settings: Vec<Setting>,
+}
+
+/// A value in a firmware configuration file, such as how long a driver
+/// waits for userspace to bring its interface up.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Setting {
+    pub name: String,
+    pub value: String,
 }
 
 /// The phone maker's update server, which the stock updater asks about the
@@ -622,6 +634,18 @@ impl DeviceConfig {
                     }
                     None => ensure!(path.is_absolute(), "[wlan] firmware: {} is not an absolute path", file.path),
                 }
+                for setting in &file.settings {
+                    ensure!(
+                        !setting.name.is_empty() && setting.name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'),
+                        "[wlan] firmware: {:?} is not a setting's name",
+                        setting.name
+                    );
+                    ensure!(
+                        !setting.value.contains(['\n', '\r']),
+                        "[wlan] firmware: {} is set over more than one line",
+                        setting.name
+                    );
+                }
             }
         }
         Ok(cfg)
@@ -1021,6 +1045,23 @@ mod tests {
     }
 
     #[test]
+    fn dada_waits_for_the_recovery_to_start_its_supplicant() {
+        let cfg = DeviceConfig::parse(include_str!("../../../devices/dada.toml")).unwrap();
+        let wlan = cfg.wlan.expect("the Xiaomi 15's WLAN is described");
+        let settings = wlan
+            .firmware
+            .iter()
+            .filter(|f| f.name.ends_with("WCNSS_qcom_cfg.ini"))
+            .flat_map(|f| &f.settings)
+            .collect::<Vec<_>>();
+        assert!(!settings.is_empty(), "both Peach drivers are told to wait");
+        assert!(
+            settings.iter().all(|s| s.name == "gInterfaceChangeWait" && s.value == "0"),
+            "the chip does not power down before wpa_supplicant opens its interface"
+        );
+    }
+
+    #[test]
     fn a_wlan_is_probed_over_plain_http() {
         let base = "[device]\ncodename = \"x\"\n[wlan]\nmodules = []\ninterface = \"wlan0\"\nsupplicant = \"/s\"\nservice = \"a/b\"\n";
         assert!(DeviceConfig::parse(&format!("{base}probe = \"http://connect.rom.miui.com/generate_204\"\n")).is_ok());
@@ -1034,11 +1075,14 @@ mod tests {
         let with = |file: &str| DeviceConfig::parse(&format!("{base}firmware = [{file}]\n"));
         assert!(with("{ name = \"wlan/a.ini\", path = \"/vendor/etc/a.ini\" }").is_ok());
         assert!(with("{ name = \"wlan/mac.bin\", partition = \"persist\", path = \"kiwi/mac.bin\" }").is_ok());
+        assert!(with("{ name = \"wlan/a.ini\", path = \"/vendor/etc/a.ini\", settings = [{ name = \"wait\", value = \"0\" }] }").is_ok());
         assert!(with("{ name = \"/etc/firmware/a.ini\", path = \"/vendor/etc/a.ini\" }").is_err());
         assert!(with("{ name = \"../a.ini\", path = \"/vendor/etc/a.ini\" }").is_err());
         assert!(with("{ name = \"a.ini\", path = \"vendor/etc/a.ini\" }").is_err());
         assert!(with("{ name = \"mac.bin\", partition = \"persist\", path = \"/kiwi/mac.bin\" }").is_err());
         assert!(with("{ name = \"mac.bin\", partition = \"by-name/persist\", path = \"mac.bin\" }").is_err());
+        assert!(with("{ name = \"wlan/a.ini\", path = \"/vendor/a.ini\", settings = [{ name = \"a=b\", value = \"0\" }] }").is_err());
+        assert!(with("{ name = \"wlan/a.ini\", path = \"/vendor/a.ini\", settings = [{ name = \"wait\", value = \"two\\nlines\" }] }").is_err());
     }
 
     #[test]
